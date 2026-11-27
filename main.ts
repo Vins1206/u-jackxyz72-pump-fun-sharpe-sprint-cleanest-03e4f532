@@ -1,31 +1,46 @@
-// Steady Pullback — a paper-trading bot for the Pump.fun Sharpe Sprint.
+// Bounce-Confirmed Pullback — a paper-trading bot for the Pump.fun Sharpe
+// Sprint (recovery cycle 1; v1 was "Steady Pullback").
 //
-// Idea (measured on the kit's dev window, 24h / 1222 mints, with a
-// slot-granular backtest that models the 2-slot fill latency and the
-// cost-basis stops exactly as the replay engine does): almost every new
-// pump.fun coin dumps, so chasing run-ups and sniping launches both lose.
-// The one shape that came out ahead buys the pullback of a proven runner:
-// a coin that already ran at least 2.5x from its first trade, then dipped
-// 20-40% off its recent high while still holding at least 3 SOL of real
-// reserves, bought on a buy trade, sold at +20% over cost or cut at -12%,
-// never held longer than 1800 slots. One entry per mint, a fixed 0.08 SOL
-// stake, at most 5 open positions. Win rate on dev is ~40% with the wins
-// paying for the stopped losses and the fees, so the book stays mostly in
-// cash, hourly equity moves stay small and steady, and the rare second
-// leg pays. That is what hourly Sharpe rewards: controlled gains, not
-// moonshots.
+// V1 bought the pullback of a proven runner on any buy trade while the
+// price sat 20-40% below its recent high. That graded +0.012 SOL / Sharpe
+// +0.014 on the official dev window, but a 20-copy stress test lost money
+// on every copy (median -0.335 SOL): the dev edge was window-specific,
+// and the per-coin log showed the damage came from entries into coins
+// still dumping — several stopped losses ran to -0.02..-0.04 SOL, far past
+// the -12% stop, because the coin never turned after entry.
 //
-// Verified dev result (grade-local, process driver, two runs): net PnL
-// +0.012 SOL, Sharpe (hourly) +0.014, Sortino +0.021, max drawdown 1.5%,
-// 87 round trips over 87 distinct mints, fully compliant. On the same
-// window the kit's baselines score hold-cash 0.000 / Sharpe null,
-// equal-weight -0.019 SOL / -0.223, and the pilots momentum -9.44 SOL /
-// -0.579, sniper -0.50 SOL / -0.844, reversion -3.99 SOL / -0.481.
-// Split into four 6-hour slices, the rule is net-positive in 3 of 4, so
-// the edge is broad rather than one lucky hour — but the final window is
-// fresh coins, and a 6-hour score is only six hourly marks, so the final
-// Sharpe will still be noisy: this is the best edge found on dev, not a
-// promise.
+// The one structural change here: buy the turn, not the level. The entry
+// shape is unchanged (a coin that ran at least 2.5x from its first trade,
+// then dipped 20-40% off its 2,500-slot high, still holding at least 3 SOL
+// of real reserves, bought on a buy trade, 0.08 SOL, one entry per mint,
+// at most 5 open, age at most 7,200 slots) — but the buy now requires a
+// bounce: the current price must sit at least 5% above the lowest price
+// sampled since that high was set. A coin in freefall cannot satisfy that
+// until it actually turns. Exits are unchanged: sell at +20% over cost,
+// cut at -12%, never hold longer than 1,800 slots.
+//
+// Screened on the slot-granular Python backtest (a 1/16 subsample of the
+// dev window, same 2-slot fill latency and cost-basis stops as the real
+// grader): bounce 5% scores net +0.158 SOL / Sharpe +0.18 with a 45% win
+// rate over 65 trades, against v1's +0.071 SOL / +0.07 and 39% over 80
+// trades on the same screen, and it is net-positive in 3 of 4 six-hour
+// slices. Bounce 3% and 12% both lose on the screen, and trailing exits
+// lose too, so 5% with the fixed exits is the version graded officially.
+// The screen is a subsample, not the official grade — the official dev
+// and stress numbers are what decide whether this replaces v1.
+//
+// Verified official dev grade (grade-local, process driver, 2026-11-27):
+// net PnL +0.2147 SOL, Sharpe (hourly) +0.2895, Sortino +0.611, max
+// drawdown 0.93%, win rate 47.9%, 73 round trips over 73 distinct mints,
+// fully compliant; two executions reproduce byte for byte. Without the top
+// 3 coins the net is still +0.075 SOL, and at 2x fees it stays +0.072 SOL
+// (v1: +0.012 SOL / +0.014, top-3-free -0.16 SOL, 2x-fees -0.163 SOL).
+// 20-copy stress test: median -0.277 SOL, p10 -0.439, p90 -0.194, 19 of 20
+// copies lost money, one copy won (+0.05 SOL) — better than v1's median
+// -0.335 SOL with 20 of 20 losing, but the dev score still sits above
+// every stress copy, so the final window stays a genuine gamble: this is
+// a better edge, not a promise. Rank-10 cutoff on the live board is
+// +0.60 SOL / Sharpe 1.055, still far above this dev score.
 //
 // A probe backstop keeps the run compliant: if fewer than 20 distinct mints
 // have completed a >= 0.01 SOL round trip late in the window, the bot opens
@@ -413,7 +428,7 @@ async function runBot(bot: Bot): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Strategy: Steady Pullback.
+// Strategy: Bounce-Confirmed Pullback.
 // ---------------------------------------------------------------------------
 
 const STAKE_LAMPORTS = 80_000_000n; // 0.08 SOL per position.
@@ -421,6 +436,8 @@ const MIN_BUY_LAMPORTS = 10_000_000n; // 0.01 SOL: the round-trip floor.
 const RUNUP_PCT = 150; // the recent high must be +150% over the first trade.
 const DIP_LO_PCT = 20; // buy 20-40% below that high.
 const DIP_HI_PCT = 40;
+const BOUNCE_PCT = 5; // ...but only once the price has bounced 5% off the
+// low sampled since that high was set: buy the turn, not the level.
 const MIN_REAL_SOL = 3_000_000_000n; // at least 3 SOL of real reserves.
 const TAKE_PROFIT_PCT = 20; // sell when value is +20% over cost.
 const STOP_PCT = 12; // sell when value is -12% under cost.
@@ -603,7 +620,7 @@ function createStrategy(): Bot {
         }
       }
 
-      // 2) Pullback entries on the mints this batch touched.
+      // 2) Bounce-confirmed pullback entries on the mints this batch touched.
       const buysInFlight = (): number =>
         orders.filter((o) => o.side === "buy").length;
       for (const mint of touched) {
@@ -615,20 +632,23 @@ function createStrategy(): Bot {
         if (curve === undefined || curve.complete) continue;
         if (batch.slot - rec.firstSeenSlot > MAX_AGE_SLOTS) continue;
         if (curve.real_quote_reserves < MIN_REAL_SOL) continue;
-        // Prune price samples older than the high window and find the high.
+        // Prune price samples older than the high window and find the high
+        // plus the slot where it was first set.
         const cutoff = batch.slot - HIGH_WINDOW_SLOTS;
         while (rec.samples.length > 0 && rec.samples[0].slot < cutoff) {
           rec.samples.shift();
         }
         let highVq = 0n;
         let highVt = 1n;
+        let highSlot = -1;
         for (const s of rec.samples) {
           if (cmpPrice(s.vq, s.vt, highVq, highVt) > 0) {
             highVq = s.vq;
             highVt = s.vt;
+            highSlot = s.slot;
           }
         }
-        if (highVq <= 0n) continue;
+        if (highVq <= 0n || highSlot < 0) continue;
         // The high must be a proven run: +150% over the first trade.
         if (
           !priceAtLeast(highVq, highVt, rec.baseVq, rec.baseVt, RUNUP_PCT)
@@ -640,6 +660,19 @@ function createStrategy(): Bot {
         const nowVt = curve.virtual_token_reserves;
         if (!priceAtMost(nowVq, nowVt, highVq, highVt, DIP_LO_PCT)) continue;
         if (priceAtMost(nowVq, nowVt, highVq, highVt, DIP_HI_PCT)) continue;
+        // ...and it must have bounced at least 5% off the lowest price
+        // sampled since the high was set: buy the turn, not the level.
+        let lowVq = 0n;
+        let lowVt = 1n;
+        for (const s of rec.samples) {
+          if (s.slot < highSlot) continue;
+          if (lowVq === 0n || cmpPrice(s.vq, s.vt, lowVq, lowVt) < 0) {
+            lowVq = s.vq;
+            lowVt = s.vt;
+          }
+        }
+        if (lowVq <= 0n) continue;
+        if (!priceAtLeast(nowVq, nowVt, lowVq, lowVt, BOUNCE_PCT)) continue;
         if (
           state.committedPositionCount() + buysInFlight() >=
           state.hello.caps.max_open_positions
